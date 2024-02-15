@@ -5,6 +5,36 @@
 extern "C" {
 #endif
 
+enum ready_state_t {
+  WS_READY_STATE_CONNECTING = 0x0,
+  WS_READY_STATE_OPEN       = 0x1,
+  WS_READY_STATE_CLOSING    = 0x2,
+  WS_READY_STATE_CLOSED     = 0x3
+};
+enum opcode_t {
+  WS_OPCODE_CONTINUE = 0x0,
+  WS_OPCODE_TEXT     = 0x1,
+  WS_OPCODE_BINARY   = 0x2,
+  WS_OPCODE_CLOSE    = 0x8,
+  WS_OPCODE_PING     = 0x9,
+  WS_OPCODE_PONG     = 0xa
+};
+
+enum close_code_t {
+  WS_STATUS_NORMAL                = 1000,
+  WS_STATUS_GOING_AWAY            = 1001,
+  WS_STATUS_PROTOCOL_ERROR        = 1002,
+  WS_STATUS_UNSUPPORTED_DATA_TYPE = 1003,
+  WS_STATUS_NOT_AVAILABLE         = 1005,
+  WS_STATUS_ABNORMAL_CLOSED       = 1006,
+  WS_STATUS_INVALID_PAYLOAD       = 1007,
+  WS_STATUS_POLICY_VIOLATION      = 1008,
+  WS_STATUS_MESSAGE_TOO_BIG       = 1009,
+  WS_STATUS_INVALID_EXTENTION     = 1010,
+  WS_STATUS_UNEXPECTED_CONDITION  = 1011,
+  WS_STATUS_TLS_HANDSHAKE_ERROR   = 1015
+};
+
 typedef struct websocket websocket_t;
 typedef struct websocket_client websocket_client_t;
 typedef struct ws_context ws_context_t;
@@ -12,7 +42,7 @@ typedef struct ws_context ws_context_t;
 /* Globals */
 void websocket_verbose(const char* format, ...);
 /* Server */
-websocket_t* websocket_new(int port);
+websocket_t* websocket_new(int port, const char * host);
 void websocket_stop(websocket_t * ws);
 
 void websocket_on_connected(
@@ -41,8 +71,6 @@ void websocket_destroy(websocket_t* ws);
 void websocket_client_destroy(websocket_client_t* client);
 void websocket_client_set_state(websocket_client_t* client, int state);
 int websocket_client_get_state(websocket_client_t* client);
-
-void broken_pipe_handler(int sig);
 
 /* Client */
 ws_context_t * ws_context_new();

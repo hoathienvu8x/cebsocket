@@ -1,16 +1,29 @@
+#define _GNU_SOURCE
+
 #include <ws.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <pthread.h>
+#include <math.h>
 
 #define _ws_alloc       malloc
 #define _ws_free        free
 #define _ws_zero(p, sz) memset((p), 0, sz)
 
+#define MAX_FRAME_BUFFER (4096)
+
 struct websocket {
   int port;
   char * host;
+  int fd;
   unsigned long long id;
   websocket_client_t * clients;
   websocket_client_t * current;
@@ -18,13 +31,11 @@ struct websocket {
   void (*on_data)(websocket_client_t *, char *, int);
   void (*on_disconnected)(websocket_client_t *);
   int (*middware)(const char *);
-  int state;
   int stop;
 };
 
 struct websocket_client {
   int id;
-  int socket;
   int fd;
   websocket_client_t * prev;
   websocket_client_t * next;
@@ -40,8 +51,21 @@ struct ws_context {
   void (*on_data)(ws_context_t *, char *, int);
   void (*on_disconnected)(ws_context_t *);
 };
+#ifndef _WIN32
+int closesocket(int fd) {
+  shutdown(fd, SHUT_RDWR);
+  return close(fd);
+}
+#endif
 /* Static */
 static int is_ws_url(const char * url);
+static int create_socket(
+  const char * host, int port,
+  int (*check)(int, const struct sockaddr *, socklen_t)
+);
+static void broken_pipe_handler(int sig);
+static void ws_context_set_state(ws_context_t * ctx, int state);
+static void _websocket_send(int fd, char * message, int opcode);
 /* Globals */
 void websocket_verbose(const char* format, ...) {
   #ifndef NDEBUG
@@ -56,19 +80,19 @@ void websocket_verbose(const char* format, ...) {
 }
 
 /* Server */
-websocket_t* websocket_new(int port) {
+websocket_t* websocket_new(int port, const char * host) {
   websocket_t * rv = _ws_alloc(sizeof(*rv));
   if (!rv) return NULL;
   _ws_zero(rv, sizeof(*rv));
   rv->port = port;
-  rv->host = NULL;
+  rv->host = (char *)host;
   rv->on_connected = NULL;
   rv->on_data = NULL;
   rv->on_disconnected = NULL;
   rv->middware = NULL;
   rv->id = -1;
+  rv->fd = -1;
   rv->stop = 1;
-  rv->state = 0;
   rv->clients = NULL;
   rv->current = NULL;
   return NULL;
@@ -103,14 +127,50 @@ void websocket_middware(
   ws->middware = middware;
 }
 
+static void * websocket_listen_thread(void * data) {
+  return data;
+}
+
 void websocket_listen(websocket_t* ws, int thread) {
   if (!ws) return;
-  (void)thread;
+  sigaction(SIGPIPE, &(struct sigaction){ broken_pipe_handler }, NULL);
+  int srv = create_socket(ws->host, ws->port, bind);
+  if (srv < 0) {
+    perror("Socket error ");
+    exit(1);
+  }
+  if (listen(srv, 10) < 0) {
+    perror("Listen error ");
+    exit(1);
+  }
+  websocket_verbose("WebSocket server is listening from %s:%d\n", (ws->host ? ws->host : "0.0.0.0"), ws->port);
+  ws->stop = 0;
+  if (!thread) {
+    (void)websocket_listen_thread(ws);
+  } else {
+    pthread_t th;
+    if(pthread_create(&th, NULL, websocket_listen_thread, ws)) {
+      perror("Create thread error: ");
+      exit(1);
+    }
+    pthread_detach(th);
+  }
 }
 void websocket_send(websocket_client_t* client, char* message, int opcode) {
   if (!client) return;
-  (void)message;
-  (void)opcode;
+  #ifndef NDEBUG
+  if (opcode == WS_OPCODE_TEXT) {
+    websocket_verbose(
+      "Sending to #%d (%d): %s\n", client->id, client->fd, message
+    );
+  } else {
+    websocket_verbose(
+      "Sending to #%d (%d): %ld bytes\n",
+      client->id, client->fd, message ? strlen(message) : 0
+    );
+  }
+  #endif
+  _websocket_send(client->fd, message, opcode);
 }
 void websocket_send_broadcast(
   websocket_client_t* client, char* message, int opcode
@@ -146,11 +206,11 @@ websocket_client_t* websocket_client_init() {
   if (!rv) return NULL;
   _ws_zero(rv, sizeof(*rv));
   rv->id = -1;
-  rv->socket = -1;
   rv->fd = -1;
   rv->next = NULL;
   rv->prev = NULL;
   rv->ws = NULL;
+  rv->state = WS_READY_STATE_CONNECTING;
   return rv;
 }
 void websocket_destroy(websocket_t* ws) {
@@ -183,17 +243,31 @@ int websocket_client_get_state(websocket_client_t* client) {
   int rc = client->state;
   return rc;
 }
-void broken_pipe_handler(int sig) {
-  (void)sig;
-  websocket_verbose("Broken pipe.\n");
-}
-
 /* Client */
 ws_context_t * ws_context_new() {
-  return NULL;
+  ws_context_t * rv = _ws_alloc(sizeof(*rv));
+  if (!rv) return NULL;
+  _ws_zero(rv, sizeof(*rv));
+  rv->fd = -1;
+  rv->stop = 1;
+  rv->state = WS_READY_STATE_CONNECTING;
+  rv->on_connected = NULL;
+  rv->on_data = NULL;
+  rv->on_disconnected = NULL;
+  return rv;
 }
 void ws_context_destroy(ws_context_t * ctx) {
   if (!ctx) return;
+  ws_context_stop(ctx);
+  ws_context_set_state(ctx, WS_READY_STATE_CLOSING);
+  if (ctx->fd > 0) {
+    (void)closesocket(ctx->fd);
+  }
+  ws_context_set_state(ctx, WS_READY_STATE_CLOSED);
+  ctx->on_connected = NULL;
+  ctx->on_data = NULL;
+  ctx->on_disconnected = NULL;
+  _ws_free(ctx);
 }
 int ws_context_connect(ws_context_t * ctx, const char * url, int thread) {
   return ws_context_connect_origin(ctx, url, NULL, thread);
@@ -242,12 +316,120 @@ int ws_context_get_state(ws_context_t * ctx) {
   int rc = ctx->state;
   return rc;
 }
+/* Static */
 static int is_ws_url(const char * url) {
-  if (!url || strlen(url) < 4) {
+  if (!url || strlen(url) < 8) {
     return 0;
   }
-  if (strncasecmp(url, "ws://", 5) == 0 || strncasecmp(url, "wss://", 6) == 0) {
+  if (
+    strncasecmp(url, "ws://", 5) == 0 ||
+    strncasecmp(url, "wss://", 6) == 0
+  ) {
     return 1;
   }
   return 0;
+}
+static int create_socket(
+  const char * host, int port,
+  int (*check)(int, const struct sockaddr *, socklen_t)
+) {
+  struct addrinfo hints, *result, *p;
+  int rc, fd, opval = 1;
+  memset(&hints, 0, sizeof(struct addrinfo));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+  char sport[20] = {0};
+  sprintf(sport, "%d", port);
+  rc = getaddrinfo(host, sport, &hints, &result);
+  if (rc != 0) return (-1);
+  for(p = result; p; p = p->ai_next) {
+    fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd < 0) continue;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opval, sizeof(opval)) < 0) {
+      closesocket(fd);
+      continue;
+    }
+    rc = check(fd, p->ai_addr, p->ai_addrlen);
+    if (rc == 0 || (rc < 0 && errno == EINPROGRESS)) break;
+    closesocket(fd);
+  }
+  freeaddrinfo(result);
+  if (!p) return (-1);
+  return fd;
+}
+static void broken_pipe_handler(int sig) {
+  (void)sig;
+  websocket_verbose("Broken pipe.\n");
+}
+static void ws_context_set_state(ws_context_t * ctx, int state) {
+  if (!ctx) return;
+  ctx->state = state;
+}
+static void _websocket_send(int fd, char * message, int opcode) {
+  unsigned int length = (unsigned int)strlen(message);
+  unsigned int all_frames = ceil((float)length / MAX_FRAME_BUFFER);
+  if(all_frames == 0) {
+    all_frames = 1;
+  }
+  unsigned int max_frames = all_frames - 1;
+  unsigned int last_buffer_length = 0;
+  unsigned int pad = MAX_FRAME_BUFFER - 10;
+  if(length % pad != 0) {
+    last_buffer_length = length % pad;
+  } else {
+    if(length != 0) {
+      last_buffer_length = pad;
+    }
+  }
+  unsigned char * ptr = message;
+
+  for(int i = 0; i < all_frames; i++) {
+    unsigned char fin = (i != max_frames) ? 0x0 : 0x80;
+    unsigned char op = i != 0 ? 0x0 : opcode;
+    unsigned int buffer_length = (i != max_frames) ? pad : last_buffer_length;
+    unsigned char buf[MAX_FRAME_BUFFER] = {0};
+    unsigned int total_length = 0;
+    unsigned int pos = 0;
+    if(buffer_length <= 125) {
+      total_length = buffer_length + 2;
+      buf[0] = fin | op;
+      buf[1] = (uint64_t)buffer_length & 0x7f;
+      pos = 2;
+    } else if (buffer_length <= 65535) {
+      total_length = buffer_length + 4;
+      buf[0] = fin | op;
+      buf[1] = 0x7e;
+      buf[2] = ((uint64_t)buffer_length >> 8) & 0x7f;
+      buf[3] = (uint64_t)buffer_length & 0xff;
+      pos = 4;
+    } else {
+      total_length = buffer_length + 10;
+      buf[0] = fin | op;
+      buf[1] = 0x7f;
+      buf[2] = (unsigned char)(((uint64_t)buffer_length > 56) & 0xff);
+      buf[3] = (unsigned char)(((uint64_t)buffer_length > 48) & 0xff);
+      buf[4] = (unsigned char)(((uint64_t)buffer_length > 40) & 0xff);
+      buf[5] = (unsigned char)(((uint64_t)buffer_length > 32) & 0xff);
+      buf[6] = (unsigned char)(((uint64_t)buffer_length > 24) & 0xff);
+      buf[7] = (unsigned char)(((uint64_t)buffer_length > 16) & 0xff);
+      buf[8] = (unsigned char)(((uint64_t)buffer_length > 8) & 0xff);
+      buf[9] = (unsigned char)((uint64_t)buffer_length & 0xff);
+      pos = 10;
+    }
+    ptr += i * pad;
+    memcpy(buf + pos, ptr, buffer_length);
+    unsigned int left = total_length;
+    char * tmp = (char *)&buf[0];
+    do {
+      int sent = send(fd, tmp, left, 0);
+      if(sent < 0) {
+        websocket_verbose("Sending message error\n");
+        goto end;
+      }
+      left -= sent;
+      tmp += sent;
+    } while (left > 0);
+  }
+end:;
 }
