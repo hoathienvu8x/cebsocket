@@ -51,6 +51,13 @@ struct ws_context {
   void (*on_data)(ws_context_t *, char *, int);
   void (*on_disconnected)(ws_context_t *);
 };
+
+struct url_t {
+  char host[128];
+  char path[512];
+  int port;
+  int is_ssl;
+};
 #ifndef _WIN32
 int closesocket(int fd) {
   shutdown(fd, SHUT_RDWR);
@@ -66,6 +73,7 @@ static int create_socket(
 static void broken_pipe_handler(int sig);
 static void ws_context_set_state(ws_context_t * ctx, int state);
 static void _websocket_send(int fd, char * message, int opcode);
+static int _parse_ws_url(const char * url, struct url_t * p);
 /* Globals */
 void websocket_verbose(const char* format, ...) {
   #ifndef NDEBUG
@@ -432,4 +440,38 @@ static void _websocket_send(int fd, char * message, int opcode) {
     } while (left > 0);
   }
 end:;
+}
+static int _parse_ws_url(const char * url, struct url_t * p) {
+  if (!is_ws_url(url)) return -1;
+  _ws_zero(p->host, sizeof(p->host));
+  _ws_zero(p->path, sizeof(p->path));
+  p->port = 80;
+  p->is_ssl = 0;
+  if (
+    sscanf(url, "ws://%[^:/]:%d/%s", p->host, &p->port, p->path) == 3 ||
+    sscanf(url, "wss://%[^:/]:%d/%s", p->host, &p->port, p->path) == 3
+  ) {
+    goto ok;
+  } else if (
+    sscanf(url, "ws://%[^:/]/%s", p->host, p->path) == 2 ||
+    sscanf(url, "wss://%[^:/]/%s", p->host, p->path) == 2
+  ) {
+    goto ok;
+  } else if (
+    sscanf(url, "ws://%[^:/]:%d", p->host, &p->port) == 2 ||
+    sscanf(url, "wss://%[^:/]:%d", p->host, &p->port) == 2
+  ) {
+    p->path[0] = '\0';
+    goto ok;
+  } else if (
+    sscanf(url, "ws://%[^:/]", p->host) == 1 ||
+    sscanf(url, "wss://%[^:/]", p->host) == 1
+  ) {
+    p->path[0] = '\0';
+    goto ok;
+  }
+  return -1;
+ok:
+  p->is_ssl = strncasecmp(url, "wss://", 6) == 0 ? 1 : 0;
+  return 0;
 }
