@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <signal.h>
@@ -19,6 +20,12 @@
 #define _ws_zero(p, sz) memset((p), 0, sz)
 
 #define MAX_FRAME_BUFFER (4096)
+#define SHA1_BASE64_SIZE (29)
+#define WEBSOCKET_GUID   "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+#define HTTP_HEADER_BUFF_SIZE (4096)
+#define HTTP_PROP_BUFF_SIZE   (40)
+#define HTTP_VAL_BUFF_SIZE    (512)
 
 struct websocket {
   int port;
@@ -37,6 +44,7 @@ struct websocket {
 struct websocket_client {
   int id;
   int fd;
+  char address[INET6_ADDRSTRLEN + 1];
   websocket_client_t * prev;
   websocket_client_t * next;
   int state;
@@ -74,6 +82,12 @@ static void broken_pipe_handler(int sig);
 static void ws_context_set_state(ws_context_t * ctx, int state);
 static void _websocket_send(int fd, char * message, int opcode);
 static int _parse_ws_url(const char * url, struct url_t * p);
+static int sha1base64(
+  const unsigned char *data, char *encoded, size_t databytes
+);
+static void base64_decode(
+  const unsigned char * src, char * dest, size_t len
+);
 /* Globals */
 void websocket_verbose(const char* format, ...) {
   #ifndef NDEBUG
@@ -135,7 +149,219 @@ void websocket_middware(
   ws->middware = middware;
 }
 
+static void * websocket_connection_handle(void * data) {
+  sigaction(SIGPIPE, &(struct sigaction){ broken_pipe_handler }, NULL);
+  websocket_client_t * client = data;
+  ssize_t rc;
+  enum ws_parse_state {
+    WS_PARSE_STATE_METHOD = 0,
+    WS_PARSE_STATE_PROP,
+    WS_PARSE_STATE_SPACE,
+    WS_PARSE_STATE_VAL,
+    WS_PARSE_STATE_CR,
+    WS_PARSE_STATE_END
+  };
+  enum ws_parse_state sta = WS_PARSE_STATE_METHOD;
+  char ch;
+  int is_cr = 0, is_lf = 0;
+  char header_buf[HTTP_HEADER_BUFF_SIZE] = {0};
+  char prop_buf[HTTP_PROP_BUFF_SIZE] = {0};
+  char val_buf[HTTP_PROP_BUFF_SIZE] = {0};
+  int header_i = 0, prop_i = 0, val_i = 0;
+  char ws_key[128] = {0};
+  char hostname[512] = {0};
+  char version[4] = {0};
+  char upgrade[20] = {0};
+  recv_package:
+  rc = recv(client->fd, &ch, 1, MSG_WAITALL);
+  if(!rc) {
+    websocket_verbose("Client disconnected: %s\n", client->address);
+    if(client->ws->on_disconnected) {
+      client->ws->on_disconnected(client);
+    }
+    goto recv_done;
+  }
+  if(sta == WS_PARSE_STATE_METHOD) {
+    if(!is_cr) {
+      if(ch == '\r') {
+        is_cr = 1;
+      }
+    } else {
+      if (ch == '\n') {
+        sta = WS_PARSE_STATE_PROP;
+        goto recv_package;
+      } else {
+        closesocket(client->fd);
+        goto recv_done;
+      }
+    }
+    *(header_buf + (header_i++)) = ch;
+    if (!is_lf) goto recv_package;
+    is_lf = 0;
+    if (
+      strncasecmp(header_buf, "GET ", 4) != 0 ||
+      strncasecmp(
+        header_buf + 5 + strcspn(header_buf + 5," ") + 1,
+        "HTTP/1.", 7
+      ) != 0
+    ) {
+      closesocket(client->fd);
+      goto recv_done;
+    }
+    if(client->ws->middware) {
+      char path[512] = {0};
+      memcpy(path, header_buf + 5, strcspn(header_buf + 5, "?#"));
+      path[strlen(path)] = '\0';
+      if (!client->ws->middware(path)) {
+        closesocket(client->fd);
+        goto recv_done;
+      }
+    }
+    goto recv_package;
+  } else if (sta == WS_PARSE_STATE_PROP) {
+    if (ch == '\r') {
+      sta = WS_PARSE_STATE_END;
+    } else if (ch != ':') {
+      *(prop_buf + (prop_i++)) = ch;
+    } else {
+      sta = WS_PARSE_STATE_SPACE;
+      *(prop_buf + (prop_i)) = '\0';
+      prop_i = 0;
+    }
+  } else if (sta == WS_PARSE_STATE_SPACE) {
+    if(ch != ' ') {
+      closesocket(client->fd);
+      goto recv_done;
+    } else {
+      sta = WS_PARSE_STATE_VAL;
+    }
+  } else if (sta == WS_PARSE_STATE_VAL) {
+    if (ch == '\r') {
+      sta = WS_PARSE_STATE_CR;
+      *(val_buf + (val_i)) = '\0';
+      val_i = 0;
+    } else {
+      *(val_buf + (val_i++)) = ch;
+    }
+  } else if (sta == WS_PARSE_STATE_CR) {
+    if (ch == '\n') {
+      sta = WS_PARSE_STATE_PROP;
+      if (strcasecmp(prop_buf, "sec-websocket-key") == 0) {
+        memcpy(ws_key, val_buf, strlen(val_buf));
+      } else if (strcasecmp(prop_buf, "host") == 0) {
+        memcpy(hostname, val_buf, strlen(val_buf));
+      } else if (strcasecmp(prop_buf, "sec-websocket-version") == 0) {
+        memcpy(version, val_buf, strlen(val_buf));
+      } else if (strcasecmp(prop_buf, "upgrade") == 0) {
+        memcpy(upgrade, val_buf, strlen(val_buf));
+      }
+    } else {
+      closesocket(client->fd);
+      goto recv_done;
+    }
+  } else if (sta == WS_PARSE_STATE_END) {
+    if (ch == '\n') {
+      if (
+        strlen(ws_key) == 0 || strlen(hostname) == 0 ||
+        strlen(version) == 0 || strlen(upgrade) == 0
+      ) {
+        closesocket(client->fd);
+        goto recv_done;
+      }
+      if(strcasestr(upgrade, "websocket") == NULL) {
+        closesocket(client->fd);
+        goto recv_done;
+      }
+      char decoded[20] = {0};
+      base64_decode(ws_key, decoded, strlen(ws_key));
+      if(strlen(decoded) != 16) {
+        closesocket(client->fd);
+        goto recv_done;
+      }
+      if (atoi(version) < 7) {
+        closesocket(client->fd);
+        goto recv_done;
+      }
+      strcat(ws_key, WEBSOCKET_GUID);
+      char accept[SHA1_BASE64_SIZE] = {0};
+      if (sha1base64(ws_key, accept, strlen(ws_key))) {
+        closesocket(client->fd);
+        goto recv_done;
+      }
+      char buf[4096] = {0};
+      strcat(
+        buf,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Accept: "
+      );
+      strcat(buf, accept);
+      strcat(buf, "\r\nHost: ");
+      strcat(buf, hostname);
+      strcat(buf, "\r\n\r\n");
+      char * tmp = &buf[0];
+      int left = (int)strlen(buf);
+      do {
+        rc = send(client->fd, tmp, strlen(tmp), 0);
+        if (rc < 0) {
+          closesocket(client->fd);
+          goto recv_done;
+        }
+        left -= rc;
+        tmp += rc;
+      } while (left > 0);
+      if(client->ws->on_connected) {
+        client->ws->on_connected(client);
+      }
+      goto recv_socket;
+    }
+  }
+  goto recv_package;
+recv_socket:;
+
+recv_done:
+  return data;
+}
 static void * websocket_listen_thread(void * data) {
+  websocket_t * ws = data;
+  ws->clients = NULL;
+  ws->current = NULL;
+
+  int fd;
+  struct sockaddr_in c;
+  int clen = sizeof(c);
+
+  while (!ws->stop) {
+    fd = accept(ws->fd, (struct sockaddr *)&c, &clen);
+    if (fd < 0) {
+      perror("Accept error: ");
+      exit(1);
+    }
+    websocket_client_t * cli = websocket_client_new();
+    if (!cli) {
+      websocket_verbose("Could not create client socket\n");
+      exit(1);
+    }
+    cli->id = ++ws->id;
+    cli->ws = ws;
+    cli->fd = fd;
+    inet_ntop(AF_INET, (void*)&c.sin_addr, cli->address, INET_ADDRSTRLEN);
+    websocket_verbose("Client connected: #%d (%s)\n", cli->id, cli->address);
+    if (!ws->clients) {
+      ws->clients = cli;
+    } else {
+      cli->prev = ws->current;
+      ws->current->next = cli;
+    }
+    ws->current = cli;
+    pthread_t th;
+    if (
+      pthread_create(&th, NULL, (void*)&websocket_connection_handle, (void *)cli)
+    ) {
+      websocket_verbose("Could not create client thread\n");
+      exit(1);
+    }
+    pthread_detach(th);
+  }
+  ws->stop = 1;
   return data;
 }
 
@@ -209,7 +435,7 @@ int websocket_is_stop(websocket_t * ws) {
   return rc;
 }
 
-websocket_client_t* websocket_client_init() {
+websocket_client_t* websocket_client_new() {
   websocket_client_t * rv = _ws_alloc(sizeof(*rv));
   if (!rv) return NULL;
   _ws_zero(rv, sizeof(*rv));
@@ -219,6 +445,7 @@ websocket_client_t* websocket_client_init() {
   rv->prev = NULL;
   rv->ws = NULL;
   rv->state = WS_READY_STATE_CONNECTING;
+  _ws_zero(rv->address, sizeof(rv->address));
   return rv;
 }
 void websocket_destroy(websocket_t* ws) {
@@ -474,4 +701,148 @@ static int _parse_ws_url(const char * url, struct url_t * p) {
 ok:
   p->is_ssl = strncasecmp(url, "wss://", 6) == 0 ? 1 : 0;
   return 0;
+}
+static int sha1base64(
+  const unsigned char *data, char *encoded, size_t databytes
+) {
+  #define SHA1ROTATELEFT(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
+
+  uint32_t W[80];
+  uint32_t H[] = {
+    0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
+  };
+  uint32_t a, b, c, d, e, f = 0, k = 0;
+
+  uint32_t idx, lidx, widx, didx = 0;
+
+  int32_t wcount;
+  uint32_t temp;
+  uint64_t databits = ((uint64_t)databytes) * 8;
+  uint32_t loopcount = (databytes + 8) / 64 + 1;
+  uint32_t tailbytes = 64 * loopcount - databytes;
+  uint8_t datatail[128] = {0};
+
+  if (!encoded) return -1;
+
+  if (!data) return -1;
+  datatail[0] = 0x80;
+  datatail[tailbytes - 8] = (uint8_t) (databits >> 56 & 0xFF);
+  datatail[tailbytes - 7] = (uint8_t) (databits >> 48 & 0xFF);
+  datatail[tailbytes - 6] = (uint8_t) (databits >> 40 & 0xFF);
+  datatail[tailbytes - 5] = (uint8_t) (databits >> 32 & 0xFF);
+  datatail[tailbytes - 4] = (uint8_t) (databits >> 24 & 0xFF);
+  datatail[tailbytes - 3] = (uint8_t) (databits >> 16 & 0xFF);
+  datatail[tailbytes - 2] = (uint8_t) (databits >> 8 & 0xFF);
+  datatail[tailbytes - 1] = (uint8_t) (databits >> 0 & 0xFF);
+
+  for (lidx = 0; lidx < loopcount; lidx++) {
+    memset (W, 0, 80 * sizeof (uint32_t));
+    for (widx = 0; widx <= 15; widx++) {
+      wcount = 24;
+      while (didx < databytes && wcount >= 0) {
+        W[widx] += (((uint32_t)data[didx]) << wcount);
+        didx++;
+        wcount -= 8;
+      }
+      while (wcount >= 0) {
+        W[widx] += (((uint32_t)datatail[didx - databytes]) << wcount);
+        didx++;
+        wcount -= 8;
+      }
+    }
+    for (widx = 16; widx <= 31; widx++) {
+      W[widx] = SHA1ROTATELEFT ((W[widx - 3] ^ W[widx - 8] ^ W[widx - 14] ^ W[widx - 16]), 1);
+    }
+    for (widx = 32; widx <= 79; widx++) {
+      W[widx] = SHA1ROTATELEFT ((W[widx - 6] ^ W[widx - 16] ^ W[widx - 28] ^ W[widx - 32]), 2);
+    }
+    a = H[0];
+    b = H[1];
+    c = H[2];
+    d = H[3];
+    e = H[4];
+
+    for (idx = 0; idx <= 79; idx++) {
+      if (idx <= 19) {
+        f = (b & c) | ((~b) & d);
+        k = 0x5A827999;
+      } else if (idx >= 20 && idx <= 39) {
+        f = b ^ c ^ d;
+        k = 0x6ED9EBA1;
+      } else if (idx >= 40 && idx <= 59) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8F1BBCDC;
+      } else if (idx >= 60 && idx <= 79) {
+        f = b ^ c ^ d;
+        k = 0xCA62C1D6;
+      }
+      temp = SHA1ROTATELEFT (a, 5) + f + e + k + W[idx];
+      e = d;
+      d = c;
+      c = SHA1ROTATELEFT (b, 30);
+      b = a;
+      a = temp;
+    }
+
+    H[0] += a;
+    H[1] += b;
+    H[2] += c;
+    H[3] += d;
+    H[4] += e;
+  }
+
+  if (encoded) {
+    static const uint8_t *table = (const unsigned char*)
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+      "abcdefghijklmnopqrstuvwxyz"
+      "0123456789"
+      "+/";
+    uint32_t triples[7] = {
+      ((H[0] & 0xffffff00) >> 1*8),
+      ((H[0] & 0x000000ff) << 2*8) | ((H[1] & 0xffff0000) >> 2*8),
+      ((H[1] & 0x0000ffff) << 1*8) | ((H[2] & 0xff000000) >> 3*8),
+      ((H[2] & 0x00ffffff) << 0*8),
+      ((H[3] & 0xffffff00) >> 1*8),
+      ((H[3] & 0x000000ff) << 2*8) | ((H[4] & 0xffff0000) >> 2*8),
+      ((H[4] & 0x0000ffff) << 1*8)
+    };
+    for (int i = 0; i < 7; i++){
+      uint32_t x = triples[i];
+      encoded[i * 4 + 0] = table[(x >> 3 * 6) % 64];
+      encoded[i * 4 + 1] = table[(x >> 2 * 6) % 64];
+      encoded[i * 4 + 2] = table[(x >> 1 * 6) % 64];
+      encoded[i * 4 + 3] = table[(x >> 0 * 6) % 64];
+    }
+    encoded[SHA1_BASE64_SIZE - 2] = '=';
+    encoded[SHA1_BASE64_SIZE - 1] = '\0';
+  }
+  return 0;
+}
+static void base64_decode(
+  const unsigned char * src, char * dest, size_t len
+) {
+  unsigned char dtable[256] = {0}, *pos = (unsigned char *)dest;
+  size_t i, cnt;
+  static const unsigned char base64_table[65] = 
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const unsigned char * end = src + len, * in = src;
+  while(end - in >= 3) {
+    *pos++ = base64_table[in[0] >> 2];
+    *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
+    *pos++ = base64_table[((in[1] & 0x0f) << 2) | (in[2] >> 6)];
+    *pos++ = base64_table[in[2] & 0x3f];
+    in += 3;
+  }
+  if(end - in) {
+    *pos++ = base64_table[in[0] >> 2];
+    if (end - in == 1) {
+      *pos++ = base64_table[(in[0] & 0x03) << 4];
+      *pos++ = '=';
+    } else {
+      *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
+      *pos++ = base64_table[(in[1] & 0x0f) << 2];
+    }
+    *pos++ = '=';
+  }
+  *pos = '\0';
 }

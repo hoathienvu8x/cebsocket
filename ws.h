@@ -19,7 +19,7 @@ enum opcode_t {
   WS_OPCODE_PING     = 0x9,
   WS_OPCODE_PONG     = 0xa
 };
-
+// https://github.com/Luka967/websocket-close-codes
 enum close_code_t {
   WS_STATUS_NORMAL                = 1000,
   WS_STATUS_GOING_AWAY            = 1001,
@@ -66,7 +66,7 @@ void websocket_send_broadcast(
 void websocket_send_all(websocket_t* ws, char* message, int opcode);
 int websocket_is_stop(websocket_t * ws);
 
-websocket_client_t* websocket_client_init();
+websocket_client_t* websocket_client_new();
 void websocket_destroy(websocket_t* ws);
 void websocket_client_destroy(websocket_client_t* client);
 void websocket_client_set_state(websocket_client_t* client, int state);
