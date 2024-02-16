@@ -117,7 +117,7 @@ websocket_t* websocket_new(int port, const char * host) {
   rv->stop = 1;
   rv->clients = NULL;
   rv->current = NULL;
-  return NULL;
+  return rv;
 }
 void websocket_stop(websocket_t * ws) {
   if (!ws) return;
@@ -172,6 +172,13 @@ static void * websocket_connection_handle(void * data) {
   char hostname[512] = {0};
   char version[4] = {0};
   char upgrade[20] = {0};
+  char * req = NULL;
+  uint16_t header0_16, plen16, plen64;
+  uint64_t plen;
+  uint8_t opcode = WS_OPCODE_BINARY, is_masked;
+  unsigned char mkey[4];
+  int code = WS_STATUS_PROTOCOL_ERROR;
+
   recv_package:
   rc = recv(client->fd, &ch, 1, MSG_WAITALL);
   if(!rc) {
@@ -191,7 +198,6 @@ static void * websocket_connection_handle(void * data) {
         sta = WS_PARSE_STATE_PROP;
         goto recv_package;
       } else {
-        closesocket(client->fd);
         goto recv_done;
       }
     }
@@ -205,7 +211,6 @@ static void * websocket_connection_handle(void * data) {
         "HTTP/1.", 7
       ) != 0
     ) {
-      closesocket(client->fd);
       goto recv_done;
     }
     if(client->ws->middware) {
@@ -213,11 +218,9 @@ static void * websocket_connection_handle(void * data) {
       memcpy(path, header_buf + 5, strcspn(header_buf + 5, "?#"));
       path[strlen(path)] = '\0';
       if (!client->ws->middware(path)) {
-        closesocket(client->fd);
         goto recv_done;
       }
     }
-    goto recv_package;
   } else if (sta == WS_PARSE_STATE_PROP) {
     if (ch == '\r') {
       sta = WS_PARSE_STATE_END;
@@ -230,7 +233,6 @@ static void * websocket_connection_handle(void * data) {
     }
   } else if (sta == WS_PARSE_STATE_SPACE) {
     if(ch != ' ') {
-      closesocket(client->fd);
       goto recv_done;
     } else {
       sta = WS_PARSE_STATE_VAL;
@@ -256,7 +258,6 @@ static void * websocket_connection_handle(void * data) {
         memcpy(upgrade, val_buf, strlen(val_buf));
       }
     } else {
-      closesocket(client->fd);
       goto recv_done;
     }
   } else if (sta == WS_PARSE_STATE_END) {
@@ -265,27 +266,22 @@ static void * websocket_connection_handle(void * data) {
         strlen(ws_key) == 0 || strlen(hostname) == 0 ||
         strlen(version) == 0 || strlen(upgrade) == 0
       ) {
-        closesocket(client->fd);
         goto recv_done;
       }
       if(strcasestr(upgrade, "websocket") == NULL) {
-        closesocket(client->fd);
         goto recv_done;
       }
       char decoded[20] = {0};
       base64_decode(ws_key, decoded, strlen(ws_key));
       if(strlen(decoded) != 16) {
-        closesocket(client->fd);
         goto recv_done;
       }
       if (atoi(version) < 7) {
-        closesocket(client->fd);
         goto recv_done;
       }
       strcat(ws_key, WEBSOCKET_GUID);
       char accept[SHA1_BASE64_SIZE] = {0};
       if (sha1base64(ws_key, accept, strlen(ws_key))) {
-        closesocket(client->fd);
         goto recv_done;
       }
       char buf[4096] = {0};
@@ -302,7 +298,6 @@ static void * websocket_connection_handle(void * data) {
       do {
         rc = send(client->fd, tmp, strlen(tmp), 0);
         if (rc < 0) {
-          closesocket(client->fd);
           goto recv_done;
         }
         left -= rc;
@@ -311,13 +306,81 @@ static void * websocket_connection_handle(void * data) {
       if(client->ws->on_connected) {
         client->ws->on_connected(client);
       }
-      goto recv_socket;
+      goto recv_frame;
     }
   }
   goto recv_package;
-recv_socket:;
+
+recv_frame:
+  rc = recv(client->fd, &header0_16, 2, MSG_WAITALL);
+  if (!rc) {
+    code = WS_STATUS_UNSUPPORTED_DATA_TYPE;
+    goto recv_done;
+  }
+  opcode = ((uint8_t)header0_16) & 0x0f;
+  is_masked = (*(((uint8_t*)(&header0_16))+1)) & -128;
+  plen = (*(((uint8_t*)(&header0_16))+1)) & 127;
+  if (plen == 126) {
+    rc = recv(client->fd, &plen16, 2, MSG_WAITALL);
+    if (!rc) goto recv_done;
+    plen = ntohs(plen16);
+  } else if (plen == 127) {
+    rc = recv(client->fd, &plen64, 8, MSG_WAITALL);
+    if (!rc) goto recv_done;
+    plen = ntohs(plen64);
+  }
+  if (is_masked) {
+    rc = recv(client->fd, mkey, 4, MSG_WAITALL);
+    if (!rc) goto recv_done;
+  }
+  req = _ws_alloc(plen + 1);
+  req[plen] = '\0';
+  rc = recv(client->fd, req, plen, MSG_WAITALL);
+  if (!rc) {
+    code = WS_STATUS_GOING_AWAY;
+    goto recv_done;
+  }
+  if (is_masked) {
+    for(int i = 0; i < plen; i++) {
+      req[i] ^= mkey[i % 4];
+    }
+  }
+  websocket_verbose("Data from #%d: %s\n", client->id, req);
+  switch (opcode) {
+    case WS_OPCODE_CLOSE: {
+      code = WS_STATUS_NORMAL;
+      goto recv_done;
+    } break;
+    case WS_OPCODE_PING: {
+      websocket_send(client, req, WS_OPCODE_PONG);
+    } break;
+    case WS_OPCODE_PONG: {
+      
+    } break;
+    case WS_OPCODE_TEXT: case WS_OPCODE_BINARY: {
+      if (client->ws->on_data) {
+        client->ws->on_data(client, req, opcode);
+      }
+    } break;
+    default: {
+      code = WS_STATUS_UNSUPPORTED_DATA_TYPE;
+      goto recv_done;
+    } break;
+  }
+  if (req) _ws_free(req);
+  goto recv_frame;
 
 recv_done:
+  if (opcode == WS_OPCODE_CLOSE) {
+    if (req && strlen(req) > 2) {
+      _websocket_send(client->fd, req, WS_OPCODE_CLOSE);
+    } else {
+      unsigned char msg[2] = { (code >> 8), (code & 0xff) };
+      _websocket_send(client->fd, msg, WS_OPCODE_CLOSE);
+    }
+  }
+  if (req) _ws_free(req);
+  closesocket(client->fd);
   return data;
 }
 static void * websocket_listen_thread(void * data) {
@@ -377,7 +440,11 @@ void websocket_listen(websocket_t* ws, int thread) {
     perror("Listen error ");
     exit(1);
   }
-  websocket_verbose("WebSocket server is listening from %s:%d\n", (ws->host ? ws->host : "0.0.0.0"), ws->port);
+  websocket_verbose(
+    "WebSocket server is listening from %s:%d\n",
+    (ws->host ? ws->host : "0.0.0.0"), ws->port
+  );
+  ws->fd = srv;
   ws->stop = 0;
   if (!thread) {
     (void)websocket_listen_thread(ws);
