@@ -67,6 +67,14 @@ struct url_t {
   int port;
   int is_ssl;
 };
+enum ws_parse_state {
+  WS_PARSE_STATE_BEGIN = 0,
+  WS_PARSE_STATE_PROP,
+  WS_PARSE_STATE_SPACE,
+  WS_PARSE_STATE_VAL,
+  WS_PARSE_STATE_END
+};
+
 #ifndef _WIN32
 int closesocket(int fd) {
   shutdown(fd, SHUT_RDWR);
@@ -152,14 +160,7 @@ static void * websocket_connection_handle(void * data) {
   sigaction(SIGPIPE, &(struct sigaction){ broken_pipe_handler }, NULL);
   websocket_client_t * client = data;
   ssize_t rc;
-  enum ws_parse_state {
-    WS_PARSE_STATE_METHOD = 0,
-    WS_PARSE_STATE_PROP,
-    WS_PARSE_STATE_SPACE,
-    WS_PARSE_STATE_VAL,
-    WS_PARSE_STATE_END
-  };
-  enum ws_parse_state sta = WS_PARSE_STATE_METHOD;
+  enum ws_parse_state sta = WS_PARSE_STATE_BEGIN;
   char ch;
   int is_cr = 0;
   char header_buf[HTTP_HEADER_BUFF_SIZE] = {0};
@@ -186,7 +187,7 @@ static void * websocket_connection_handle(void * data) {
     }
     goto recv_done;
   }
-  if (sta == WS_PARSE_STATE_METHOD) {
+  if (sta == WS_PARSE_STATE_BEGIN) {
     if (!is_cr) {
       if (ch == '\r') is_cr = 1;
     } else {
@@ -237,7 +238,7 @@ static void * websocket_connection_handle(void * data) {
   } else if (sta == WS_PARSE_STATE_SPACE) {
     if (ch != ' ') goto recv_done;
     sta = WS_PARSE_STATE_VAL;
-    memset(val_buf, 0, sizeof(val_buf));
+    _ws_zero(val_buf, sizeof(val_buf));
   } else if (sta == WS_PARSE_STATE_VAL) {
     if (ch != '\n' && ch != '\r') {
       *(val_buf + (val_i++)) = ch;
@@ -602,8 +603,89 @@ static int ws_context_handshake(
     sprintf(buf + strlen(buf), "\r\nOrigin: %s", origin);
   }
   strcat(buf, "\r\n\r\n");
-  printf("%s", buf);
-  return -1;
+  char * tmp = &buf[0];
+  int left = (int)strlen(buf);
+  do {
+    int rc = send(ctx->fd, tmp, strlen(tmp), 0);
+    if (rc < 0) return -1;
+    left -= rc;
+    tmp += rc;
+  } while(left > 0);
+  ssize_t rc;
+  int is_cr = 0;
+  char header_buf[1024] = {0}, prop_buf[50] = {0}, val_buf[1024] = {0};
+  int header_i = 0, prop_i = 0, val_i = 0;
+  enum ws_parse_state sta = WS_PARSE_STATE_BEGIN;
+  char ch;
+  recv_package:
+  rc = recv(ctx->fd, &ch, 1, MSG_WAITALL);
+  if (!rc) return -1;
+  if (sta == WS_PARSE_STATE_BEGIN) {
+    if (!is_cr) {
+      if (ch == '\r') is_cr = 1;
+    } else {
+      if (ch == '\n') {
+        sta = WS_PARSE_STATE_PROP;
+        goto recv_package;
+      }
+      return -1;
+    }
+    *(header_buf + (header_i++)) = ch;
+    if (!is_cr) goto recv_package;
+    *(header_buf + header_i) = '\0';
+    if (strncasecmp(header_buf, "http/1.", 7) != 0) return -1;
+    if (strncmp(header_buf + strcspn(header_buf, " ") + 1, "101 ", 4) != 0) {
+      return -1;
+    }
+    sta = WS_PARSE_STATE_PROP;
+  } else if (sta == WS_PARSE_STATE_PROP) {
+    if (ch == '\r' || ch == '\n') {
+      if (ch == '\r') {
+        sta = WS_PARSE_STATE_END;
+      }
+      goto recv_package;
+    }
+    if (ch != ':') {
+      *(prop_buf + (prop_i++)) = ch;
+      goto recv_package;
+    }
+    *(prop_buf + prop_i) = '\0';
+    prop_i = 0;
+    sta = WS_PARSE_STATE_SPACE;
+  } else if (sta == WS_PARSE_STATE_SPACE) {
+    if (ch != ' ') return -1;
+    sta = WS_PARSE_STATE_VAL;
+    _ws_zero(val_buf, sizeof(val_buf));
+  } else if (sta == WS_PARSE_STATE_VAL) {
+    if (ch != '\r' && ch != '\n') {
+      *(val_buf + (val_i++)) = ch;
+      goto recv_package;
+    }
+    *(val_buf + val_i) = '\0';
+    if (strcasecmp(prop_buf, "upgrade") == 0) {
+      if (strcasestr(val_buf, "websocket") == NULL) return -1;
+    } else if (strcasecmp(prop_buf, "connection") == 0) {
+      if (strcasecmp(val_buf, "upgrade") != 0) return-1;
+    } else if (strcasecmp(prop_buf, "sec-websocket-accept") == 0) {
+      char accept_key[1024] = {0};
+      memcpy(accept_key, nonce, 16);
+      strcat(accept_key, WEBSOCKET_GUID);
+      char expected_base64[1024] = {0};
+      if (sha1base64(accept_key, expected_base64, strlen(accept_key))) {
+        return -1;
+      }
+      if (strcmp(expected_base64, val_buf) != 0) {
+        return -1;
+      }
+    }
+    val_i = 0;
+  } else {
+    goto recv_done;
+  }
+  goto recv_package;
+recv_done:
+  ws_context_set_state(ctx, WS_READY_STATE_OPEN);
+  return 0;
 }
 int ws_context_connect_origin(
   ws_context_t * ctx, const char * url, const char * origin, int thread
@@ -619,11 +701,11 @@ int ws_context_connect_origin(
   if (fd < 0) {
     return -1;
   }
+  ctx->fd = fd;
   if (ws_context_handshake(ctx, &purl, origin)) {
     websocket_verbose("Handshake fail\n");
     return -1;
   }
-  ctx->fd = fd;
   ctx->stop = 0;
   if (ctx->on_connected) {
     ctx->on_connected(ctx);
