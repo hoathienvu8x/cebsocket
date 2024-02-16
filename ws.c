@@ -86,9 +86,7 @@ static int _parse_ws_url(const char * url, struct url_t * p);
 static int sha1base64(
   const unsigned char *data, char *encoded, size_t databytes
 );
-static void base64_decode(
-  const unsigned char * src, char * dest, size_t len
-);
+static int base64_decode(char *bufplain, const char *bufcoded);
 /* Globals */
 void websocket_verbose(const char* format, ...) {
   #ifndef NDEBUG
@@ -188,8 +186,6 @@ static void * websocket_connection_handle(void * data) {
     }
     goto recv_done;
   }
-
-  printf("[%d, %c]\n", sta, ch);
   if (sta == WS_PARSE_STATE_METHOD) {
     if (!is_cr) {
       if (ch == '\r') is_cr = 1;
@@ -248,21 +244,18 @@ static void * websocket_connection_handle(void * data) {
       goto recv_package;
     }
     *(val_buf + val_i) = '\0';
-    val_i = 0;
-    printf("prop_buf = %s\n",prop_buf);
     if (strcasecmp(prop_buf, "sec-websocket-key") == 0) {
-      memcpy(ws_key, val_buf, strlen(val_buf));
+      memcpy(ws_key, val_buf, val_i + 1);
     } else if (strcasecmp(prop_buf, "host") == 0) {
-      memcpy(hostname, val_buf, strlen(val_buf));
+      memcpy(hostname, val_buf, val_i + 1);
     } else if (strcasecmp(prop_buf, "sec-websocket-version") == 0) {
-      memcpy(version, val_buf, strlen(val_buf));
+      memcpy(version, val_buf, val_i + 1);
     } else if (strcasecmp(prop_buf, "upgrade") == 0) {
-      memcpy(upgrade, val_buf, strlen(val_buf));
+      memcpy(upgrade, val_buf, val_i + 1);
     }
-    memset(prop_buf, 0, sizeof(prop_buf));
+    val_i = 0;
     sta = WS_PARSE_STATE_PROP;
   } else if (sta == WS_PARSE_STATE_END) {
-    printf("ws_key = %s\nhostname = %s\nversion = %s\nupgrade = %s\n",ws_key,hostname, version, upgrade);
     if (
       strlen(ws_key) == 0 || strlen(hostname) == 0 ||
       strlen(version) == 0 || strlen(upgrade) == 0
@@ -273,7 +266,9 @@ static void * websocket_connection_handle(void * data) {
       goto recv_done;
     }
     char decoded[20] = {0};
-    base64_decode(ws_key, decoded, strlen(ws_key));
+    if(base64_decode(decoded, ws_key) <= 0) {
+      goto recv_done;
+    }
     if(strlen(decoded) != 16) {
       goto recv_done;
     }
@@ -970,31 +965,67 @@ static int sha1base64(
   }
   return 0;
 }
-static void base64_decode(
-  const unsigned char * src, char * dest, size_t len
-) {
-  unsigned char dtable[256] = {0}, *pos = (unsigned char *)dest;
-  size_t i, cnt;
-  static const unsigned char base64_table[65] = 
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  const unsigned char * end = src + len, * in = src;
-  while(end - in >= 3) {
-    *pos++ = base64_table[in[0] >> 2];
-    *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
-    *pos++ = base64_table[((in[1] & 0x0f) << 2) | (in[2] >> 6)];
-    *pos++ = base64_table[in[2] & 0x3f];
-    in += 3;
+// https://opensource.apple.com/source/QuickTimeStreamingServer/QuickTimeStreamingServer-452/CommonUtilitiesLib/base64.c
+static int base64_decode(char *bufplain, const char *bufcoded) {
+  static const unsigned char pr2six[256] =
+  {
+    /* ASCII table */
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64,
+    64,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
+    64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
+  };
+  int nbytesdecoded;
+  const unsigned char *bufin;
+  unsigned char *bufout;
+  int nprbytes;
+
+  bufin = (const unsigned char *) bufcoded;
+  while (pr2six[*(bufin++)] <= 63);
+  nprbytes = (bufin - (const unsigned char *) bufcoded) - 1;
+  nbytesdecoded = ((nprbytes + 3) / 4) * 3;
+
+  bufout = (unsigned char *) bufplain;
+  bufin = (const unsigned char *) bufcoded;
+
+  while (nprbytes > 4) {
+    *(bufout++) =
+        (unsigned char) (pr2six[*bufin] << 2 | pr2six[bufin[1]] >> 4);
+    *(bufout++) =
+        (unsigned char) (pr2six[bufin[1]] << 4 | pr2six[bufin[2]] >> 2);
+    *(bufout++) =
+        (unsigned char) (pr2six[bufin[2]] << 6 | pr2six[bufin[3]]);
+    bufin += 4;
+    nprbytes -= 4;
   }
-  if(end - in) {
-    *pos++ = base64_table[in[0] >> 2];
-    if (end - in == 1) {
-      *pos++ = base64_table[(in[0] & 0x03) << 4];
-      *pos++ = '=';
-    } else {
-      *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
-      *pos++ = base64_table[(in[1] & 0x0f) << 2];
-    }
-    *pos++ = '=';
+
+  /* Note: (nprbytes == 1) would be an error, so just ingore that case */
+  if (nprbytes > 1) {
+  *(bufout++) =
+      (unsigned char) (pr2six[*bufin] << 2 | pr2six[bufin[1]] >> 4);
   }
-  *pos = '\0';
+  if (nprbytes > 2) {
+  *(bufout++) =
+      (unsigned char) (pr2six[bufin[1]] << 4 | pr2six[bufin[2]] >> 2);
+  }
+  if (nprbytes > 3) {
+  *(bufout++) =
+      (unsigned char) (pr2six[bufin[2]] << 6 | pr2six[bufin[3]]);
+  }
+
+  *(bufout++) = '\0';
+  nbytesdecoded -= (4 - nprbytes) & 3;
+  return nbytesdecoded;
 }
