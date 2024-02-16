@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/time.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <signal.h>
@@ -80,7 +81,7 @@ static int create_socket(
 );
 static void broken_pipe_handler(int sig);
 static void ws_context_set_state(ws_context_t * ctx, int state);
-static void _websocket_send(int fd, char * message, int opcode);
+static void _websocket_send(int fd, char * message, int opcode, int mask);
 static int _parse_ws_url(const char * url, struct url_t * p);
 static int sha1base64(
   const unsigned char *data, char *encoded, size_t databytes
@@ -373,10 +374,10 @@ recv_frame:
 recv_done:
   if (opcode == WS_OPCODE_CLOSE) {
     if (req && strlen(req) > 2) {
-      _websocket_send(client->fd, req, WS_OPCODE_CLOSE);
+      _websocket_send(client->fd, req, WS_OPCODE_CLOSE, 0);
     } else {
       unsigned char msg[2] = { (code >> 8), (code & 0xff) };
-      _websocket_send(client->fd, msg, WS_OPCODE_CLOSE);
+      _websocket_send(client->fd, msg, WS_OPCODE_CLOSE, 0);
     }
   }
   if (req) _ws_free(req);
@@ -471,7 +472,7 @@ void websocket_send(websocket_client_t* client, char* message, int opcode) {
     );
   }
   #endif
-  _websocket_send(client->fd, message, opcode);
+  _websocket_send(client->fd, message, opcode, 0);
 }
 void websocket_send_broadcast(
   websocket_client_t* client, char* message, int opcode
@@ -574,11 +575,49 @@ void ws_context_destroy(ws_context_t * ctx) {
 int ws_context_connect(ws_context_t * ctx, const char * url, int thread) {
   return ws_context_connect_origin(ctx, url, NULL, thread);
 }
+static void * ws_context_listen(void * data) {
+  return data;
+}
+static int ws_context_handshake(
+  ws_context_t * ctx, struct url_t * url, const char * origin
+) {
+  return -1;
+}
 int ws_context_connect_origin(
   ws_context_t * ctx, const char * url, const char * origin, int thread
 ) {
   if (!ctx) return (-1);
   if (!is_ws_url(url)) return (-1);
+  struct url_t purl;
+  if (_parse_ws_url(url, &purl)) {
+    websocket_verbose("Could not connect to '%s'\n", url);
+    return -1;
+  }
+  int fd = create_socket(purl.host, purl.port, connect);
+  if (fd < 0) {
+    return -1;
+  }
+  if (ws_context_handshake(ctx, &purl, origin)) {
+    websocket_verbose("Handshake fail\n");
+    return -1;
+  }
+  ctx->fd = fd;
+  ctx->stop = 0;
+  if (ctx->on_connected) {
+    ctx->on_connected(ctx);
+  }
+  if (!thread) {
+    (void)ws_context_listen(ctx);
+  } else {
+    pthread_t th;
+    if (
+      pthread_create(&th, NULL, (void *)ws_context_listen, (void*)ctx)
+    ) {
+      websocket_verbose("Could not create socket listen\n");
+      return -1;
+    }
+    pthread_detach(th);
+  }
   return 0;
 }
 void ws_context_on_connected(
@@ -610,8 +649,14 @@ void ws_context_stop(ws_context_t * ctx) {
 }
 void ws_context_send(ws_context_t * ctx, char * message, int opcode) {
   if (!ctx) return;
-  (void)message;
-  (void)opcode;
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  srand(tv.tv_usec * tv.tv_sec);
+  int mask = 0;
+  do {
+    mask = rand();
+  } while(mask == 0);
+  _websocket_send(ctx->fd, message, opcode, mask);
 }
 int ws_context_get_state(ws_context_t * ctx) {
   if (!ctx) return 0;
@@ -668,7 +713,7 @@ static void ws_context_set_state(ws_context_t * ctx, int state) {
   if (!ctx) return;
   ctx->state = state;
 }
-static void _websocket_send(int fd, char * message, int opcode) {
+static void _websocket_send(int fd, char * message, int opcode, int mask) {
   unsigned int length = (unsigned int)strlen(message);
   unsigned int all_frames = ceil((float)length / MAX_FRAME_BUFFER);
   if(all_frames == 0) {
@@ -677,6 +722,9 @@ static void _websocket_send(int fd, char * message, int opcode) {
   unsigned int max_frames = all_frames - 1;
   unsigned int last_buffer_length = 0;
   unsigned int pad = MAX_FRAME_BUFFER - 10;
+  if (mask) {
+    pad += 4;
+  }
   if(length % pad != 0) {
     last_buffer_length = length % pad;
   } else {
@@ -719,8 +767,18 @@ static void _websocket_send(int fd, char * message, int opcode) {
       buf[9] = (unsigned char)((uint64_t)buffer_length & 0xff);
       pos = 10;
     }
+    if (mask) {
+      buf[1] |= 0x80;
+      memcpy(&buf[pos], &mask, 4);
+      pos += 4;
+    }
     ptr += i * pad;
     memcpy(buf + pos, ptr, buffer_length);
+    if(mask) {
+      for(int i = 0; i < buffer_length; i++) {
+        buf[pos + i] ^= (buf[pos + i % 4] & 0xff);
+      }
+    }
     unsigned int left = total_length;
     char * tmp = (char *)&buf[0];
     do {
