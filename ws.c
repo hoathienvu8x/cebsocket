@@ -159,12 +159,11 @@ static void * websocket_connection_handle(void * data) {
     WS_PARSE_STATE_PROP,
     WS_PARSE_STATE_SPACE,
     WS_PARSE_STATE_VAL,
-    WS_PARSE_STATE_CR,
     WS_PARSE_STATE_END
   };
   enum ws_parse_state sta = WS_PARSE_STATE_METHOD;
   char ch;
-  int is_cr = 0, is_lf = 0;
+  int is_cr = 0;
   char header_buf[HTTP_HEADER_BUFF_SIZE] = {0};
   char prop_buf[HTTP_PROP_BUFF_SIZE] = {0};
   char val_buf[HTTP_PROP_BUFF_SIZE] = {0};
@@ -189,11 +188,11 @@ static void * websocket_connection_handle(void * data) {
     }
     goto recv_done;
   }
-  if(sta == WS_PARSE_STATE_METHOD) {
-    if(!is_cr) {
-      if(ch == '\r') {
-        is_cr = 1;
-      }
+
+  printf("[%d, %c]\n", sta, ch);
+  if (sta == WS_PARSE_STATE_METHOD) {
+    if (!is_cr) {
+      if (ch == '\r') is_cr = 1;
     } else {
       if (ch == '\n') {
         sta = WS_PARSE_STATE_PROP;
@@ -203,8 +202,10 @@ static void * websocket_connection_handle(void * data) {
       }
     }
     *(header_buf + (header_i++)) = ch;
-    if (!is_lf) goto recv_package;
-    is_lf = 0;
+    if (!is_cr) {
+      goto recv_package;
+    }
+    *(header_buf + header_i) = '\0';
     if (
       strncasecmp(header_buf, "GET ", 4) != 0 ||
       strncasecmp(
@@ -222,93 +223,91 @@ static void * websocket_connection_handle(void * data) {
         goto recv_done;
       }
     }
+    sta = WS_PARSE_STATE_PROP;
   } else if (sta == WS_PARSE_STATE_PROP) {
-    if (ch == '\r') {
-      sta = WS_PARSE_STATE_END;
-    } else if (ch != ':') {
+    if(ch == '\r' || ch == '\n') {
+      if (ch != '\n') {
+        sta = WS_PARSE_STATE_END;
+      }
+      goto recv_package;
+    }
+    if (ch != ':') {
       *(prop_buf + (prop_i++)) = ch;
-    } else {
-      sta = WS_PARSE_STATE_SPACE;
-      *(prop_buf + (prop_i)) = '\0';
-      prop_i = 0;
+      goto recv_package;
     }
+    *(prop_buf + prop_i) = '\0';
+    prop_i = 0;
+    sta = WS_PARSE_STATE_SPACE;
   } else if (sta == WS_PARSE_STATE_SPACE) {
-    if(ch != ' ') {
-      goto recv_done;
-    } else {
-      sta = WS_PARSE_STATE_VAL;
-    }
+    if (ch != ' ') goto recv_done;
+    sta = WS_PARSE_STATE_VAL;
+    memset(val_buf, 0, sizeof(val_buf));
   } else if (sta == WS_PARSE_STATE_VAL) {
-    if (ch == '\r') {
-      sta = WS_PARSE_STATE_CR;
-      *(val_buf + (val_i)) = '\0';
-      val_i = 0;
-    } else {
+    if (ch != '\n' && ch != '\r') {
       *(val_buf + (val_i++)) = ch;
+      goto recv_package;
     }
-  } else if (sta == WS_PARSE_STATE_CR) {
-    if (ch == '\n') {
-      sta = WS_PARSE_STATE_PROP;
-      if (strcasecmp(prop_buf, "sec-websocket-key") == 0) {
-        memcpy(ws_key, val_buf, strlen(val_buf));
-      } else if (strcasecmp(prop_buf, "host") == 0) {
-        memcpy(hostname, val_buf, strlen(val_buf));
-      } else if (strcasecmp(prop_buf, "sec-websocket-version") == 0) {
-        memcpy(version, val_buf, strlen(val_buf));
-      } else if (strcasecmp(prop_buf, "upgrade") == 0) {
-        memcpy(upgrade, val_buf, strlen(val_buf));
-      }
-    } else {
+    *(val_buf + val_i) = '\0';
+    val_i = 0;
+    printf("prop_buf = %s\n",prop_buf);
+    if (strcasecmp(prop_buf, "sec-websocket-key") == 0) {
+      memcpy(ws_key, val_buf, strlen(val_buf));
+    } else if (strcasecmp(prop_buf, "host") == 0) {
+      memcpy(hostname, val_buf, strlen(val_buf));
+    } else if (strcasecmp(prop_buf, "sec-websocket-version") == 0) {
+      memcpy(version, val_buf, strlen(val_buf));
+    } else if (strcasecmp(prop_buf, "upgrade") == 0) {
+      memcpy(upgrade, val_buf, strlen(val_buf));
+    }
+    memset(prop_buf, 0, sizeof(prop_buf));
+    sta = WS_PARSE_STATE_PROP;
+  } else if (sta == WS_PARSE_STATE_END) {
+    printf("ws_key = %s\nhostname = %s\nversion = %s\nupgrade = %s\n",ws_key,hostname, version, upgrade);
+    if (
+      strlen(ws_key) == 0 || strlen(hostname) == 0 ||
+      strlen(version) == 0 || strlen(upgrade) == 0
+    ) {
       goto recv_done;
     }
-  } else if (sta == WS_PARSE_STATE_END) {
-    if (ch == '\n') {
-      if (
-        strlen(ws_key) == 0 || strlen(hostname) == 0 ||
-        strlen(version) == 0 || strlen(upgrade) == 0
-      ) {
-        goto recv_done;
-      }
-      if(strcasestr(upgrade, "websocket") == NULL) {
-        goto recv_done;
-      }
-      char decoded[20] = {0};
-      base64_decode(ws_key, decoded, strlen(ws_key));
-      if(strlen(decoded) != 16) {
-        goto recv_done;
-      }
-      if (atoi(version) < 7) {
-        goto recv_done;
-      }
-      strcat(ws_key, WEBSOCKET_GUID);
-      char accept[SHA1_BASE64_SIZE] = {0};
-      if (sha1base64(ws_key, accept, strlen(ws_key))) {
-        goto recv_done;
-      }
-      char buf[4096] = {0};
-      strcat(
-        buf,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-        "Connection: Upgrade\r\nSec-WebSocket-Accept: "
-      );
-      strcat(buf, accept);
-      strcat(buf, "\r\nHost: ");
-      strcat(buf, hostname);
-      strcat(buf, "\r\n\r\n");
-      char * tmp = &buf[0];
-      int left = (int)strlen(buf);
-      do {
-        rc = send(client->fd, tmp, strlen(tmp), 0);
-        if (rc < 0) {
-          goto recv_done;
-        }
-        left -= rc;
-        tmp += rc;
-      } while (left > 0);
-      if(client->ws->on_connected) {
-        client->ws->on_connected(client);
-      }
-      goto recv_frame;
+    if(strcasestr(upgrade, "websocket") == NULL) {
+      goto recv_done;
     }
+    char decoded[20] = {0};
+    base64_decode(ws_key, decoded, strlen(ws_key));
+    if(strlen(decoded) != 16) {
+      goto recv_done;
+    }
+    if (atoi(version) < 7) {
+      goto recv_done;
+    }
+    strcat(ws_key, WEBSOCKET_GUID);
+    char accept[SHA1_BASE64_SIZE] = {0};
+    if (sha1base64(ws_key, accept, strlen(ws_key))) {
+      goto recv_done;
+    }
+    char buf[4096] = {0};
+    strcat(
+      buf,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+      "Connection: Upgrade\r\nSec-WebSocket-Accept: "
+    );
+    strcat(buf, accept);
+    strcat(buf, "\r\nHost: ");
+    strcat(buf, hostname);
+    strcat(buf, "\r\n\r\n");
+    char * tmp = &buf[0];
+    int left = (int)strlen(buf);
+    do {
+      rc = send(client->fd, tmp, strlen(tmp), 0);
+      if (rc < 0) {
+        goto recv_done;
+      }
+      left -= rc;
+      tmp += rc;
+    } while (left > 0);
+    if(client->ws->on_connected) {
+      client->ws->on_connected(client);
+    }
+    goto recv_frame;
   }
   goto recv_package;
 
