@@ -13,6 +13,9 @@ OBJECTS = ws.o
 
 all: $(OBJECTS)
 
+srv: srv.o $(OBJECTS)
+	@$(CC) $(CFLAGS) srv.o $(OBJECTS) -o $@ $(LDFLAGS)
+
 %.o: %.c
 	@$(CC) -c $(CFLAGS) $< -o $@ $(LDFLAGS)
 

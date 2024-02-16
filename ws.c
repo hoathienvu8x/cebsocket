@@ -581,6 +581,34 @@ static void * ws_context_listen(void * data) {
 static int ws_context_handshake(
   ws_context_t * ctx, struct url_t * url, const char * origin
 ) {
+  char buf[4096] = {0};
+  char host[512] = {0};
+  if (url->port != 80) {
+    sprintf(host, "%s:%d", url->host, url->port);
+  } else {
+    sprintf(host, "%s", url->host);
+  }
+  unsigned char nonce[17] = {0};
+  srand(time(NULL));
+  for(int i = 0; i < 16; i++) {
+    nonce[i] = rand() & 0xff;
+  }
+  nonce[16] = '\0';
+  char wskey[50] = {0};
+  if(sha1base64(nonce, wskey, 16)) {
+    return -1;
+  }
+  sprintf(
+    buf, "GET %s HTTP/1.1\r\nUpgrade: websocket\r\nConnection: "
+    "Upgrade\r\nHost: %s\r\nSec-WebSocket-Key: %s\r\n"
+    "Sec-WebSocket-Version: 13",
+    url->path, host, wskey
+  );
+  if (origin) {
+    sprintf(buf + strlen(buf), "\r\nOrigin: %s", origin);
+  }
+  strcat(buf, "\r\n\r\n");
+  printf("%s", buf);
   return -1;
 }
 int ws_context_connect_origin(
