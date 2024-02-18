@@ -41,6 +41,7 @@ struct websocket {
   void (*on_disconnected)(websocket_client_t *);
   int (*middware)(const char *);
   int stop;
+  pthread_mutex_t mut_lck;
 };
 
 struct websocket_client {
@@ -51,6 +52,8 @@ struct websocket_client {
   websocket_client_t * next;
   int state;
   websocket_t * ws;
+  pthread_mutex_t mut_snd;
+  pthread_mutex_t mut_sta;
 };
 
 struct ws_context {
@@ -60,6 +63,9 @@ struct ws_context {
   void (*on_connected)(ws_context_t *);
   void (*on_data)(ws_context_t *, char *, int);
   void (*on_disconnected)(ws_context_t *);
+  pthread_mutex_t mut_snd;
+  pthread_mutex_t mut_sta;
+  pthread_mutex_t mut_lck;
 };
 
 struct url_t {
@@ -126,11 +132,17 @@ websocket_t* websocket_new(int port, const char * host) {
   rv->stop = 1;
   rv->clients = NULL;
   rv->current = NULL;
+  if (pthread_mutex_init(&rv->mut_lck, NULL)) {
+    _ws_free(rv);
+    return NULL;
+  }
   return rv;
 }
 void websocket_stop(websocket_t * ws) {
   if (!ws) return;
+  pthread_mutex_lock(&ws->mut_lck);
   ws->stop = 1;
+  pthread_mutex_unlock(&ws->mut_lck);
 }
 
 void websocket_on_connected(
@@ -312,6 +324,7 @@ static void * websocket_connection_handle(void * data) {
   goto recv_package;
 
 recv_frame:
+  if (websocket_is_stop(client->ws)) goto recv_done;
   rc = recv(client->fd, &head, 2, MSG_WAITALL);
   if (!rc) goto recv_done;
   opcode = head[0] & 0x0f;
@@ -373,10 +386,14 @@ recv_frame:
 recv_done:
   if (opcode == WS_OPCODE_CLOSE) {
     if (payload && payload_len > 2) {
+      pthread_mutex_lock(&client->mut_snd);
       _websocket_send(client->fd, payload, WS_OPCODE_CLOSE, 0);
+      pthread_mutex_unlock(&client->mut_snd);
     } else {
       unsigned char msg[2] = { (code >> 8), (code & 0xff) };
+      pthread_mutex_lock(&client->mut_snd);
       _websocket_send(client->fd, msg, WS_OPCODE_CLOSE, 0);
+      pthread_mutex_unlock(&client->mut_snd);
     }
   }
   if (payload) _ws_free(payload);
@@ -385,14 +402,15 @@ recv_done:
 }
 static void * websocket_listen_thread(void * data) {
   websocket_t * ws = data;
+  pthread_mutex_lock(&ws->mut_lck);
   ws->clients = NULL;
   ws->current = NULL;
-
+  pthread_mutex_unlock(&ws->mut_lck);
   int fd;
   struct sockaddr_in c;
   int clen = sizeof(c);
 
-  while (!ws->stop) {
+  while (!websocket_is_stop(ws)) {
     fd = accept(ws->fd, (struct sockaddr *)&c, &clen);
     if (fd < 0) {
       perror("Accept error: ");
@@ -408,6 +426,7 @@ static void * websocket_listen_thread(void * data) {
     cli->fd = fd;
     inet_ntop(AF_INET, (void*)&c.sin_addr, cli->address, INET_ADDRSTRLEN);
     websocket_verbose("Client connected: #%d (%s)\n", cli->id, cli->address);
+    pthread_mutex_lock(&ws->mut_lck);
     if (!ws->clients) {
       ws->clients = cli;
     } else {
@@ -415,6 +434,7 @@ static void * websocket_listen_thread(void * data) {
       ws->current->next = cli;
     }
     ws->current = cli;
+    pthread_mutex_unlock(&ws->mut_lck);
     pthread_t th;
     if (
       pthread_create(&th, NULL, (void*)&websocket_connection_handle, (void *)cli)
@@ -444,8 +464,10 @@ void websocket_listen(websocket_t* ws, int thread) {
     "WebSocket server is listening from %s:%d\n",
     (ws->host ? ws->host : "0.0.0.0"), ws->port
   );
+  pthread_mutex_lock(&ws->mut_lck);
   ws->fd = srv;
   ws->stop = 0;
+  pthread_mutex_unlock(&ws->mut_lck);
   if (!thread) {
     (void)websocket_listen_thread(ws);
   } else {
@@ -471,12 +493,15 @@ void websocket_send(websocket_client_t* client, char* message, int opcode) {
     );
   }
   #endif
+  pthread_mutex_lock(&client->mut_snd);
   _websocket_send(client->fd, message, opcode, 0);
+  pthread_mutex_unlock(&client->mut_snd);
 }
 void websocket_send_broadcast(
   websocket_client_t* client, char* message, int opcode
 ) {
   if (!client) return;
+  pthread_mutex_lock(&client->ws->mut_lck);
   for(
     websocket_client_t * p = client->ws->clients;
     p != NULL;
@@ -485,9 +510,11 @@ void websocket_send_broadcast(
     if (p->id == client->id) continue;
     websocket_send(p, message, opcode);
   }
+  pthread_mutex_unlock(&client->ws->mut_lck);
 }
 void websocket_send_all(websocket_t* ws, char* message, int opcode) {
   if (!ws) return;
+  pthread_mutex_lock(&ws->mut_lck);
   for(
     websocket_client_t * p = ws->clients;
     p != NULL;
@@ -495,10 +522,13 @@ void websocket_send_all(websocket_t* ws, char* message, int opcode) {
   ) {
     websocket_send(p, message, opcode);
   }
+  pthread_mutex_unlock(&ws->mut_lck);
 }
 int websocket_is_stop(websocket_t * ws) {
   if (!ws) return 1;
+  pthread_mutex_lock(&ws->mut_lck);
   int rc = ws->stop;
+  pthread_mutex_unlock(&ws->mut_lck);
   return rc;
 }
 
@@ -512,11 +542,19 @@ websocket_client_t* websocket_client_new() {
   rv->prev = NULL;
   rv->ws = NULL;
   rv->state = WS_READY_STATE_CONNECTING;
-  _ws_zero(rv->address, sizeof(rv->address));
+  _ws_zero(&rv->address, sizeof(rv->address));
+  if (
+    pthread_mutex_init(&rv->mut_snd, NULL) != 0 ||
+    pthread_mutex_init(&rv->mut_sta, NULL) != 0
+  ) {
+    _ws_free(rv);
+    return NULL;
+  }
   return rv;
 }
 void websocket_destroy(websocket_t* ws) {
   if (!ws) return;
+  pthread_mutex_lock(&ws->mut_lck);
   for(
     websocket_client_t * p = ws->clients;
     p != NULL;
@@ -524,25 +562,35 @@ void websocket_destroy(websocket_t* ws) {
   ) {
     websocket_client_destroy(p);
   }
+  pthread_mutex_unlock(&ws->mut_lck);
+  pthread_mutex_destroy(&ws->mut_lck);
   _ws_free(ws);
 }
 void websocket_client_destroy(websocket_client_t* client) {
   if (!client) return;
+  pthread_mutex_lock(&client->ws->mut_lck);
   if (client->next) {
     client->next->prev = client->prev;
   }
   if (client->prev) {
     client->prev->next = client->next;
   }
+  pthread_mutex_unlock(&client->ws->mut_lck);
+  pthread_mutex_destroy(&client->mut_snd);
+  pthread_mutex_destroy(&client->mut_sta);
   _ws_free(client);
 }
 void websocket_client_set_state(websocket_client_t* client, int state) {
   if (!client) return;
+  pthread_mutex_lock(&client->mut_sta);
   client->state = state;
+  pthread_mutex_unlock(&client->mut_sta);
 }
 int websocket_client_get_state(websocket_client_t* client) {
   if (!client) return 0;
+  pthread_mutex_lock(&client->mut_sta);
   int rc = client->state;
+  pthread_mutex_unlock(&client->mut_sta);
   return rc;
 }
 /* Client */
@@ -556,19 +604,32 @@ ws_context_t * ws_context_new() {
   rv->on_connected = NULL;
   rv->on_data = NULL;
   rv->on_disconnected = NULL;
+  if (
+    pthread_mutex_init(&rv->mut_snd, NULL) != 0 ||
+    pthread_mutex_init(&rv->mut_sta, NULL) != 0 ||
+    pthread_mutex_init(&rv->mut_lck, NULL) != 0
+  ) {
+    _ws_free(rv);
+    return NULL;
+  }
   return rv;
 }
 void ws_context_destroy(ws_context_t * ctx) {
   if (!ctx) return;
   ws_context_stop(ctx);
   ws_context_set_state(ctx, WS_READY_STATE_CLOSING);
+  pthread_mutex_lock(&ctx->mut_lck);
   if (ctx->fd > 0) {
     (void)closesocket(ctx->fd);
   }
+  pthread_mutex_unlock(&ctx->mut_lck);
   ws_context_set_state(ctx, WS_READY_STATE_CLOSED);
   ctx->on_connected = NULL;
   ctx->on_data = NULL;
   ctx->on_disconnected = NULL;
+  pthread_mutex_destroy(&ctx->mut_snd);
+  pthread_mutex_destroy(&ctx->mut_sta);
+  pthread_mutex_destroy(&ctx->mut_lck);
   _ws_free(ctx);
 }
 int ws_context_connect(ws_context_t * ctx, const char * url, int thread) {
@@ -584,6 +645,7 @@ static void * ws_context_listen(void * data) {
   uint64_t plen;
   unsigned char mkey[4] = {0};
   recv_frame:
+  if (ws_context_is_stop(ctx)) goto recv_done;
   rc = recv(ctx->fd, &head, 2, MSG_WAITALL);
   if (!rc) goto recv_done;
   opcode = head[0] & 0x0f;
@@ -708,14 +770,19 @@ static int ws_context_handshake(
     sprintf(buf + strlen(buf), "\r\nOrigin: %s", origin);
   }
   strcat(buf, "\r\n\r\n");
+  pthread_mutex_lock(&ctx->mut_snd);
   char * tmp = &buf[0];
   int left = (int)strlen(buf);
   do {
     int rc = send(ctx->fd, tmp, strlen(tmp), 0);
-    if (rc < 0) return -1;
+    if (rc < 0) {
+      pthread_mutex_unlock(&ctx->mut_snd);
+      return -1;
+    }
     left -= rc;
     tmp += rc;
   } while(left > 0);
+  pthread_mutex_unlock(&ctx->mut_snd);
   ssize_t rc;
   int is_cr = 0;
   char header_buf[1024] = {0}, prop_buf[50] = {0}, val_buf[1024] = {0};
@@ -737,7 +804,7 @@ static int ws_context_handshake(
     }
     *(header_buf + (header_i++)) = ch;
     if (!is_cr) goto recv_package;
-    *(header_buf + header_i) = '\0';printf("%s",header_buf);
+    *(header_buf + header_i) = '\0';
     if (strncasecmp(header_buf, "http/1.", 7) != 0) return -1;
     if (strncmp(header_buf + strcspn(header_buf, " ") + 1, "101 ", 4) != 0) {
       return -1;
@@ -758,7 +825,7 @@ static int ws_context_handshake(
     prop_i = 0;
     sta = WS_PARSE_STATE_SPACE;
   } else if (sta == WS_PARSE_STATE_SPACE) {
-    if (ch != ' ') {printf("...");return -1;}
+    if (ch != ' ') return -1;
     sta = WS_PARSE_STATE_VAL;
   } else if (sta == WS_PARSE_STATE_VAL) {
     if (ch != '\r' && ch != '\n') {
@@ -767,19 +834,18 @@ static int ws_context_handshake(
     }
     *(val_buf + val_i) = '\0';
     if (strcasecmp(prop_buf, "upgrade") == 0) {
-      if (strcasestr(val_buf, "websocket") == NULL) {printf("kkk\n");return -1;}
+      if (strcasestr(val_buf, "websocket") == NULL) return -1;
     } else if (strcasecmp(prop_buf, "connection") == 0) {
-      if (strcasecmp(val_buf, "upgrade") != 0) {printf("???");return-1;}
+      if (strcasecmp(val_buf, "upgrade") != 0) return-1;
     } else if (strcasecmp(prop_buf, "sec-websocket-accept") == 0) {
       char accept_key[1024] = {0};
       strcat(accept_key, wskey);
       strcat(accept_key, WEBSOCKET_GUID);
       char expected_base64[1024] = {0};
-      printf("%s",accept_key);
-      if (sha1base64(accept_key, expected_base64, strlen(accept_key))) {printf("4\n");
+      if (sha1base64(accept_key, expected_base64, strlen(accept_key))) {
         return -1;
       }
-      if (strcmp(expected_base64, val_buf) != 0) {printf("%s\n%s\nHe\n",expected_base64,val_buf);
+      if (strcmp(expected_base64, val_buf) != 0) {
         return -1;
       }
     }
@@ -809,12 +875,16 @@ int ws_context_connect_origin(
   if (fd < 0) {
     return -1;
   }
+  pthread_mutex_lock(&ctx->mut_lck);
   ctx->fd = fd;
+  pthread_mutex_unlock(&ctx->mut_lck);
   if (ws_context_handshake(ctx, &purl, origin)) {
     websocket_verbose("Handshake fail\n");
     return -1;
   }
+  pthread_mutex_lock(&ctx->mut_lck);
   ctx->stop = 0;
+  pthread_mutex_unlock(&ctx->mut_lck);
   if (ctx->on_connected) {
     ctx->on_connected(ctx);
   }
@@ -852,12 +922,16 @@ void ws_context_on_disconnected(
 }
 int ws_context_is_stop(ws_context_t * ctx) {
   if (!ctx) return 1;
+  pthread_mutex_lock(&ctx->mut_lck);
   int rc = ctx->stop;
+  pthread_mutex_unlock(&ctx->mut_lck);
   return rc;
 }
 void ws_context_stop(ws_context_t * ctx) {
   if (!ctx) return;
+  pthread_mutex_lock(&ctx->mut_lck);
   ctx->stop = 1;
+  pthread_mutex_unlock(&ctx->mut_lck);
 }
 void ws_context_send(ws_context_t * ctx, char * message, int opcode) {
   if (!ctx) return;
@@ -868,11 +942,15 @@ void ws_context_send(ws_context_t * ctx, char * message, int opcode) {
   do {
     mask = rand();
   } while(mask == 0);
+  pthread_mutex_lock(&ctx->mut_snd);
   _websocket_send(ctx->fd, message, opcode, mask);
+  pthread_mutex_unlock(&ctx->mut_snd);
 }
 int ws_context_get_state(ws_context_t * ctx) {
   if (!ctx) return 0;
+  pthread_mutex_lock(&ctx->mut_sta);
   int rc = ctx->state;
+  pthread_mutex_unlock(&ctx->mut_sta);
   return rc;
 }
 /* Static */
@@ -923,7 +1001,9 @@ static void broken_pipe_handler(int sig) {
 }
 static void ws_context_set_state(ws_context_t * ctx, int state) {
   if (!ctx) return;
+  pthread_mutex_lock(&ctx->mut_sta);
   ctx->state = state;
+  pthread_mutex_unlock(&ctx->mut_sta);
 }
 static void _websocket_send(int fd, char * message, int opcode, int mask) {
   unsigned int length = (unsigned int)strlen(message);
@@ -1007,8 +1087,8 @@ end:;
 }
 static int _parse_ws_url(const char * url, struct url_t * p) {
   if (!is_ws_url(url)) return -1;
-  _ws_zero(p->host, sizeof(p->host));
-  _ws_zero(p->path, sizeof(p->path));
+  _ws_zero(&p->host, sizeof(p->host));
+  _ws_zero(&p->path, sizeof(p->path));
   p->port = 80;
   p->is_ssl = 0;
   if (
