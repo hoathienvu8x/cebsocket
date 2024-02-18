@@ -17,6 +17,7 @@
 #include <math.h>
 
 #define _ws_alloc       malloc
+#define _ws_realloc     realloc
 #define _ws_free        free
 #define _ws_zero(p, sz) memset((p), 0, sz)
 
@@ -171,10 +172,11 @@ static void * websocket_connection_handle(void * data) {
   char hostname[512] = {0};
   char version[4] = {0};
   char upgrade[20] = {0};
-  char * req = NULL;
-  uint16_t header0_16, plen16, plen64;
+  char * payload = NULL;
+  uint16_t plen16, plen64;
   uint64_t plen;
-  uint8_t opcode = WS_OPCODE_BINARY, is_masked;
+  uint32_t payload_len = 0;
+  uint8_t opcode = WS_OPCODE_BINARY, is_masked, head[2] = {0}, fin;
   unsigned char mkey[4];
   int code = WS_STATUS_PROTOCOL_ERROR;
 
@@ -308,74 +310,74 @@ static void * websocket_connection_handle(void * data) {
   goto recv_package;
 
 recv_frame:
-  rc = recv(client->fd, &header0_16, 2, MSG_WAITALL);
-  if (!rc) {
-    code = WS_STATUS_UNSUPPORTED_DATA_TYPE;
-    goto recv_done;
-  }
-  opcode = ((uint8_t)header0_16) & 0x0f;
-  is_masked = (*(((uint8_t*)(&header0_16))+1)) & -128;
-  plen = (*(((uint8_t*)(&header0_16))+1)) & 127;
+  rc = recv(client->fd, &head, 2, MSG_WAITALL);
+  if (!rc) goto recv_done;
+  opcode = head[0] & 0x0f;
+  is_masked = (head[1] >> 7) & 0x01;
+  plen = head[1] & 0x7f;
+  fin = (head[0] >> 7) & 1;
   if (plen == 126) {
     rc = recv(client->fd, &plen16, 2, MSG_WAITALL);
     if (!rc) goto recv_done;
     plen = ntohs(plen16);
   } else if (plen == 127) {
-    rc = recv(client->fd, &plen64, 8, MSG_WAITALL);
+    rc = recv(client->fd, &plen64, 4, MSG_WAITALL);
     if (!rc) goto recv_done;
     plen = ntohs(plen64);
   }
   if (is_masked) {
     rc = recv(client->fd, mkey, 4, MSG_WAITALL);
     if (!rc) goto recv_done;
-  }
-  req = _ws_alloc(plen + 1);
-  req[plen] = '\0';
-  rc = recv(client->fd, req, plen, MSG_WAITALL);
-  if (!rc) {
-    code = WS_STATUS_GOING_AWAY;
+  }  
+  if (
+    opcode == WS_OPCODE_TEXT || opcode == WS_OPCODE_BINARY ||
+    opcode == WS_OPCODE_CONTINUE
+  ) {
+    if (opcode == WS_OPCODE_CONTINUE && !payload) goto recv_done;
+    if (payload) {
+      payload = (char *)_ws_realloc(payload, payload_len + plen + 1);
+    } else {
+      payload = (char *)_ws_alloc(plen + 1);
+    }
+    if (!payload) goto recv_done;
+    rc = recv(client->fd, payload + payload_len, plen, MSG_WAITALL);
+    if (!rc) goto recv_done;
+    if (is_masked) {
+      for(int i = 0; i < plen; i++) {
+        *(payload + payload_len + i) ^= mkey[i % 4];
+      }
+    }
+    payload_len += plen;
+    *(payload + payload_len) = '\0';
+    if (fin) {
+      if (client->ws->on_data) {
+        client->ws->on_data(client, payload, opcode);
+      }
+    }
+  } else if (opcode == WS_OPCODE_CLOSE) {
+    code = WS_STATUS_NORMAL;
+    goto recv_done;
+  } else if (opcode == WS_OPCODE_PONG) {}
+  else if (opcode == WS_OPCODE_PING) {
+    websocket_send(client, (payload ? payload : ""), WS_OPCODE_PONG);
+  } else {
+    code = WS_STATUS_UNSUPPORTED_DATA_TYPE;
     goto recv_done;
   }
-  if (is_masked) {
-    for(int i = 0; i < plen; i++) {
-      req[i] ^= mkey[i % 4];
-    }
-  }
-  websocket_verbose("Data from #%d: %s\n", client->id, req);
-  switch (opcode) {
-    case WS_OPCODE_CLOSE: {
-      code = WS_STATUS_NORMAL;
-      goto recv_done;
-    } break;
-    case WS_OPCODE_PING: {
-      websocket_send(client, req, WS_OPCODE_PONG);
-    } break;
-    case WS_OPCODE_PONG: {
-      
-    } break;
-    case WS_OPCODE_TEXT: case WS_OPCODE_BINARY: {
-      if (client->ws->on_data) {
-        client->ws->on_data(client, req, opcode);
-      }
-    } break;
-    default: {
-      code = WS_STATUS_UNSUPPORTED_DATA_TYPE;
-      goto recv_done;
-    } break;
-  }
-  if (req) _ws_free(req);
+  if (payload) _ws_free(payload);
+  payload_len = 0;
   goto recv_frame;
 
 recv_done:
   if (opcode == WS_OPCODE_CLOSE) {
-    if (req && strlen(req) > 2) {
-      _websocket_send(client->fd, req, WS_OPCODE_CLOSE, 0);
+    if (payload && payload_len > 2) {
+      _websocket_send(client->fd, payload, WS_OPCODE_CLOSE, 0);
     } else {
       unsigned char msg[2] = { (code >> 8), (code & 0xff) };
       _websocket_send(client->fd, msg, WS_OPCODE_CLOSE, 0);
     }
   }
-  if (req) _ws_free(req);
+  if (payload) _ws_free(payload);
   closesocket(client->fd);
   return data;
 }
@@ -571,6 +573,102 @@ int ws_context_connect(ws_context_t * ctx, const char * url, int thread) {
   return ws_context_connect_origin(ctx, url, NULL, thread);
 }
 static void * ws_context_listen(void * data) {
+  ws_context_t * ctx = data;
+  ssize_t rc;
+  char * payload = NULL;
+  uint32_t payload_len = 0;
+  uint8_t head[2] = {0}, fin, opcode, is_masked;
+  uint16_t plen16, plen64;
+  uint64_t plen;
+  unsigned char mkey[4] = {0};
+  recv_frame:
+  rc = recv(ctx->fd, &head, 2, MSG_WAITALL);
+  if (!rc) goto recv_done;
+  opcode = head[0] & 0x0f;
+  is_masked = (head[1] >> 7) & 0x01;
+  plen = head[1] & 0x7f;
+  fin = (head[0] >> 7) & 1;
+  if (plen == 126) {
+    rc = recv(ctx->fd, &plen16, 2, MSG_WAITALL);
+    if (!rc) goto recv_done;
+    plen = ntohs(plen16);
+  } else if (plen == 127) {
+    rc = recv(ctx->fd, &plen64, 4, MSG_WAITALL);
+    if (!rc) goto recv_done;
+    plen = ntohs(plen64);
+  }
+  if (is_masked) {
+    rc = recv(ctx->fd, mkey, 4, MSG_WAITALL);
+    if (!rc) goto recv_done;
+  }  
+  if (
+    opcode == WS_OPCODE_TEXT || opcode == WS_OPCODE_BINARY ||
+    opcode == WS_OPCODE_CONTINUE
+  ) {
+    if (opcode == WS_OPCODE_CONTINUE && !payload) goto recv_done;
+    if (payload) {
+      payload = (char *)_ws_realloc(payload, payload_len + plen + 1);
+    } else {
+      payload = (char *)_ws_alloc(plen + 1);
+    }
+    if (!payload) goto recv_done;
+    rc = recv(ctx->fd, payload + payload_len, plen, MSG_WAITALL);
+    if (!rc) goto recv_done;
+    if (is_masked) {
+      for(int i = 0; i < plen; i++) {
+        *(payload + payload_len + i) ^= mkey[i % 4];
+      }
+    }
+    payload_len += plen;
+    *(payload + payload_len) = '\0';
+    if (fin) {
+      if (ctx->on_data) {
+        ctx->on_data(ctx, payload, opcode);
+      }
+    }
+  } else if (opcode == WS_OPCODE_CLOSE) {
+    if (ctx->on_disconnected) {
+      ctx->on_disconnected(ctx);
+    }
+    if (ws_context_get_state(ctx) != WS_READY_STATE_CLOSING) {
+      ws_context_set_state(ctx, WS_READY_STATE_CLOSING);
+    }
+    char close_frame[4096] = {0};
+    uint16_t status = htons(WS_STATUS_NORMAL);
+    char * p = (char *)&status;
+    if (payload) {
+      sprintf(close_frame, "\\x%02x\\x%02x%s", p[0], p[1], payload);
+    } else {
+      sprintf(close_frame, "\\x%02x\\%x02x", p[0], p[1]);
+    }
+    ws_context_send(ctx, close_frame, WS_OPCODE_CLOSE);
+    goto recv_done;
+  } else if (opcode == WS_OPCODE_PONG) {}
+  else if (opcode == WS_OPCODE_PING) {
+    ws_context_send(ctx, (payload ? payload : ""), WS_OPCODE_PONG);
+  } else {
+    if (ws_context_get_state(ctx) != WS_READY_STATE_CLOSING) {
+      ws_context_set_state(ctx, WS_READY_STATE_CLOSING);
+    }
+    char close_frame[4096] = {0};
+    uint16_t status = htons(WS_STATUS_UNSUPPORTED_DATA_TYPE);
+    char * p = (char *)&status;
+    if (payload) {
+      sprintf(close_frame, "\\x%02x\\x%02x%s", p[0], p[1], payload);
+    } else {
+      sprintf(close_frame, "\\x%02x\\%x02x", p[0], p[1]);
+    }
+    ws_context_send(ctx, close_frame, WS_OPCODE_CLOSE);
+    goto recv_done;
+  }
+  if (payload) _ws_free(payload);
+  payload_len = 0;
+  goto recv_frame;
+
+recv_done:
+  if (payload) _ws_free(payload);
+  closesocket(ctx->fd);
+  ws_context_set_state(ctx, WS_READY_STATE_CLOSED);
   return data;
 }
 static int ws_context_handshake(
