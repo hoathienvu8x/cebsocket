@@ -16,8 +16,11 @@ all: $(OBJECTS)
 srv: srv.o $(OBJECTS)
 	@$(CC) $(CFLAGS) srv.o $(OBJECTS) -o $@ $(LDFLAGS)
 
+cli: cli.o $(OBJECTS)
+	@$(CC) $(CFLAGS) cli.o $(OBJECTS) -o $@ $(LDFLAGS)
+
 %.o: %.c
 	@$(CC) -c $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
-	@$(RM) $(OBJECTS)
+	@$(RM) $(OBJECTS) *.o srv cli

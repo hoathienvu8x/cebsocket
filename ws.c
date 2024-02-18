@@ -96,6 +96,7 @@ static int sha1base64(
   const unsigned char *data, char *encoded, size_t databytes
 );
 static int base64_decode(char *bufplain, const char *bufcoded);
+static int base64_encode(char * encoded, const char * string, int len);
 /* Globals */
 void websocket_verbose(const char* format, ...) {
   #ifndef NDEBUG
@@ -688,11 +689,11 @@ static int ws_context_handshake(
   }
   nonce[16] = '\0';
   char wskey[50] = {0};
-  if(sha1base64(nonce, wskey, 16)) {
+  if(!base64_encode(wskey, nonce, 16)) {
     return -1;
   }
   sprintf(
-    buf, "GET %s HTTP/1.1\r\nUpgrade: websocket\r\nConnection: "
+    buf, "GET /%s HTTP/1.1\r\nUpgrade: websocket\r\nConnection: "
     "Upgrade\r\nHost: %s\r\nSec-WebSocket-Key: %s\r\n"
     "Sec-WebSocket-Version: 13",
     url->path, host, wskey
@@ -716,7 +717,7 @@ static int ws_context_handshake(
   enum ws_parse_state sta = WS_PARSE_STATE_BEGIN;
   char ch;
   recv_package:
-  rc = recv(ctx->fd, &ch, 1, MSG_WAITALL);
+  rc = recv(ctx->fd, &ch, 1, 0);
   if (!rc) return -1;
   if (sta == WS_PARSE_STATE_BEGIN) {
     if (!is_cr) {
@@ -1208,4 +1209,29 @@ static int base64_decode(char *bufplain, const char *bufcoded) {
   *(bufout++) = '\0';
   nbytesdecoded -= (4 - nprbytes) & 3;
   return nbytesdecoded;
+}
+static int base64_encode(char * encoded, const char * string, int len) {
+  static const char basis_64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int i;
+  char * p = encoded;
+  for(i = 0; i < len - 2; i += 3) {
+    *p++ = basis_64[(string[i] >> 2) & 0x3f];
+    *p++ = basis_64[((string[i] & 0x3) << 4) | ((int) (string[i + 1] & 0xf0) >> 4)];
+    *p++ = basis_64[((string[i + 1] & 0xf) << 2) | ((int) (string[i + 2] & 0xc0) >> 6)];
+    *p++ = basis_64[string[i + 2] & 0x3f];
+  }
+  if (i < len) {
+    *p++ = basis_64[(string[i] >> 2) & 0x3f];
+    if (i == (len - 1)) {
+      *p++ = basis_64[((string[i] & 0x3) << 4)];
+      *p++ = '=';
+    } else {
+      *p++ = basis_64[((string[i] & 0x3) << 4) | ((int) (string[i + 1] & 0xf0) >> 4)];
+      *p++ = basis_64[((string[i + 1] & 0xf) << 2)];
+    }
+    *p++ = '=';
+  }
+  *p++ = '\0';
+  return p - encoded;
 }
