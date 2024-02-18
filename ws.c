@@ -241,7 +241,6 @@ static void * websocket_connection_handle(void * data) {
   } else if (sta == WS_PARSE_STATE_SPACE) {
     if (ch != ' ') goto recv_done;
     sta = WS_PARSE_STATE_VAL;
-    _ws_zero(val_buf, sizeof(val_buf));
   } else if (sta == WS_PARSE_STATE_VAL) {
     if (ch != '\n' && ch != '\r') {
       *(val_buf + (val_i++)) = ch;
@@ -258,6 +257,8 @@ static void * websocket_connection_handle(void * data) {
       memcpy(upgrade, val_buf, val_i + 1);
     }
     val_i = 0;
+    _ws_zero(&val_buf, sizeof(val_buf));
+    _ws_zero(&prop_buf, sizeof(prop_buf));
     sta = WS_PARSE_STATE_PROP;
   } else if (sta == WS_PARSE_STATE_END) {
     if (
@@ -662,8 +663,13 @@ static void * ws_context_listen(void * data) {
     ws_context_send(ctx, close_frame, WS_OPCODE_CLOSE);
     goto recv_done;
   }
-  if (payload) _ws_free(payload);
-  payload_len = 0;
+  if (fin) {
+    if (payload) {
+      _ws_free(payload);
+      payload = NULL;
+    }
+    payload_len = 0;
+  }
   goto recv_frame;
 
 recv_done:
@@ -731,7 +737,7 @@ static int ws_context_handshake(
     }
     *(header_buf + (header_i++)) = ch;
     if (!is_cr) goto recv_package;
-    *(header_buf + header_i) = '\0';
+    *(header_buf + header_i) = '\0';printf("%s",header_buf);
     if (strncasecmp(header_buf, "http/1.", 7) != 0) return -1;
     if (strncmp(header_buf + strcspn(header_buf, " ") + 1, "101 ", 4) != 0) {
       return -1;
@@ -752,9 +758,8 @@ static int ws_context_handshake(
     prop_i = 0;
     sta = WS_PARSE_STATE_SPACE;
   } else if (sta == WS_PARSE_STATE_SPACE) {
-    if (ch != ' ') return -1;
+    if (ch != ' ') {printf("...");return -1;}
     sta = WS_PARSE_STATE_VAL;
-    _ws_zero(val_buf, sizeof(val_buf));
   } else if (sta == WS_PARSE_STATE_VAL) {
     if (ch != '\r' && ch != '\n') {
       *(val_buf + (val_i++)) = ch;
@@ -762,22 +767,26 @@ static int ws_context_handshake(
     }
     *(val_buf + val_i) = '\0';
     if (strcasecmp(prop_buf, "upgrade") == 0) {
-      if (strcasestr(val_buf, "websocket") == NULL) return -1;
+      if (strcasestr(val_buf, "websocket") == NULL) {printf("kkk\n");return -1;}
     } else if (strcasecmp(prop_buf, "connection") == 0) {
-      if (strcasecmp(val_buf, "upgrade") != 0) return-1;
+      if (strcasecmp(val_buf, "upgrade") != 0) {printf("???");return-1;}
     } else if (strcasecmp(prop_buf, "sec-websocket-accept") == 0) {
       char accept_key[1024] = {0};
-      memcpy(accept_key, nonce, 16);
+      strcat(accept_key, wskey);
       strcat(accept_key, WEBSOCKET_GUID);
       char expected_base64[1024] = {0};
-      if (sha1base64(accept_key, expected_base64, strlen(accept_key))) {
+      printf("%s",accept_key);
+      if (sha1base64(accept_key, expected_base64, strlen(accept_key))) {printf("4\n");
         return -1;
       }
-      if (strcmp(expected_base64, val_buf) != 0) {
+      if (strcmp(expected_base64, val_buf) != 0) {printf("%s\n%s\nHe\n",expected_base64,val_buf);
         return -1;
       }
     }
     val_i = 0;
+    sta = WS_PARSE_STATE_PROP;
+    memset(&prop_buf, '\0', sizeof(prop_buf));
+    memset(&val_buf, '\0', sizeof(val_buf));
   } else {
     goto recv_done;
   }
